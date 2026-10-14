@@ -1,0 +1,32 @@
+# This is a placeholder poetry.lock file
+# Run `poetry lock` to generate the real one
+# Including a minimal version here to allow the Docker build to proceed
+
+[[package]]
+name = "fastapi"
+version = "0.104.1"
+description = "FastAPI framework, high performance, easy to learn, fast to code, ready for production"
+category = "main"
+optional = false
+python-versions = "*"
+
+[[package]]
+name = "gunicorn"
+version = "21.2.0"
+description = "WSGI HTTP Server for UNIX"
+category = "main"
+optional = false
+python-versions = "*"
+
+[[package]]
+name = "uvicorn"
+version = "0.24.0"
+description = "An ASGI server implementation, using uvloop and httptools"
+category = "main"
+optional = false
+python-versions = ">=3.7"
+
+[metadata]
+lock-version = "2.0"
+python-versions = "^3.11"
+content-hash = "placeholder"

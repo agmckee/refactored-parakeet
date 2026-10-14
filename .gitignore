@@ -1,0 +1,54 @@
+# Dependency directories
+frontend/node_modules/
+backend/.venv/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+frontend/dist/
+frontend/build/
+backend/*.pyc
+backend/__pycache__/
+
+# Logs
+*.log
+logs/
+
+# Environment files (never commit these!)
+.env
+.env.local
+.env.*.local
+
+# Testing
+coverage/
+.htmlcov/
+.pytest_cache/
+.tox/
+
+# Python
+*.egg-info/
+dist/
+build/
+
+# Docker/Podman
+.docker/
+.podman/
+
+# GitLab CI cache
+.podman-cache/
+
+# ECS deployment artifacts
+.ecs/
+
+# Temporary files
+tmp/
+temp/

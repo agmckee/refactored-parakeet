@@ -1,0 +1,406 @@
+# =============================================================================
+# MONOREPO PIPELINE: Frontend (React) + Backend (Python)
+# Flow: feature/* -> develop -> staging -> main (tags for production)
+# Tooling: podman & podman compose
+# Deployment: Amazon ECS Fargate
+# =============================================================================
+
+stages:
+  - setup
+  - build
+  - test
+  - scan
+  - deploy
+
+variables:
+  # AWS ECR repository names
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/yourproject
+  
+  # Image names
+  FRONTEND_IMAGE: ${ECR_REPOSITORY}/frontend:${CI_COMMIT_REF_SLUG}
+  BACKEND_IMAGE: ${ECR_REPOSITORY}/backend:${CI_COMMIT_REF_SLUG}
+  
+  # Production tag images
+  FRONTEND_PROD_IMAGE: ${ECR_REPOSITORY}/frontend:${CI_COMMIT_TAG}
+  BACKEND_PROD_IMAGE: ${ECR_REPOSITORY}/backend:${CI_COMMIT_TAG}
+  
+  # Cache paths
+  FRONTEND_CACHE: frontend/node_modules
+  BACKEND_CACHE: backend/.venv
+  PODMAN_CACHE: .podman-cache
+
+# -----------------------------------------------------------------------------
+# Global cache configuration
+# -----------------------------------------------------------------------------
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - ${FRONTEND_CACHE}
+    - ${BACKEND_CACHE}
+    - ${PODMAN_CACHE}
+  policy: pull-push
+
+# -----------------------------------------------------------------------------
+# Setup Stage: Install dependencies
+# -----------------------------------------------------------------------------
+
+setup:frontend:
+  stage: setup
+  image: node:20-alpine
+  script:
+    - cd frontend
+    - npm ci --cache ${FRONTEND_CACHE} --prefer-offline
+  artifacts:
+    paths:
+      - frontend/node_modules/
+    expire_in: 1 hour
+  rules:
+    - changes:
+        - frontend/**/*
+    - when: never
+
+setup:backend:
+  stage: setup
+  image: python:3.11-slim
+  before_script:
+    - pip install poetry
+  script:
+    - cd backend
+    - poetry config virtualenvs.in-project true
+    - poetry install --no-interaction --no-ansi
+  artifacts:
+    paths:
+      - backend/.venv/
+    expire_in: 1 hour
+  rules:
+    - changes:
+        - backend/**/*
+    - when: never
+
+# -----------------------------------------------------------------------------
+# Build Stage: Container images with podman
+# -----------------------------------------------------------------------------
+
+build:frontend:
+  stage: build
+  image: quay.io/podman/stable:latest
+  variables:
+    PODMAN_STORAGE_DRIVER: overlay
+    PODMAN_INFRA_CONTAINER: ""
+  before_script:
+    - podman system connection default
+    - podman info
+    - aws ecr get-login-password --region ${AWS_REGION} | podman login --username AWS --password-stdin ${ECR_REPOSITORY}
+  script:
+    - |
+      podman build \
+        --layers \
+        --tag ${FRONTEND_IMAGE} \
+        --file frontend/Dockerfile \
+        frontend/
+      podman push ${FRONTEND_IMAGE}
+  needs: ["setup:frontend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - changes:
+        - frontend/**/*
+    - when: never
+
+build:backend:
+  stage: build
+  image: quay.io/podman/stable:latest
+  variables:
+    PODMAN_STORAGE_DRIVER: overlay
+    PODMAN_INFRA_CONTAINER: ""
+  before_script:
+    - podman system connection default
+    - podman info
+    - aws ecr get-login-password --region ${AWS_REGION} | podman login --username AWS --password-stdin ${ECR_REPOSITORY}
+  script:
+    - |
+      podman build \
+        --layers \
+        --tag ${BACKEND_IMAGE} \
+        --file backend/Dockerfile \
+        backend/
+      podman push ${BACKEND_IMAGE}
+  needs: ["setup:backend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - changes:
+        - backend/**/*
+    - when: never
+
+# -----------------------------------------------------------------------------
+# Test Stage
+# -----------------------------------------------------------------------------
+
+test:frontend:
+  stage: test
+  image: node:20-alpine
+  script:
+    - cd frontend
+    - npm test
+  needs: ["setup:frontend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - changes:
+        - frontend/**/*
+    - when: never
+
+test:backend:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install poetry
+  script:
+    - cd backend
+    - source .venv/bin/activate
+    - poetry run pytest tests/ --junitxml=test-results.xml
+  artifacts:
+    reports:
+      junit: backend/test-results.xml
+  needs: ["setup:backend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - changes:
+        - backend/**/*
+    - when: never
+
+test:integration:
+  stage: test
+  image: quay.io/podman/stable:latest
+  variables:
+    PODMAN_STORAGE_DRIVER: overlay
+    PODMAN_INFRA_CONTAINER: ""
+  before_script:
+    - podman system connection default
+    - aws ecr get-login-password --region ${AWS_REGION} | podman login --username AWS --password-stdin ${ECR_REPOSITORY}
+  script:
+    - |
+      # Pull built images
+      podman pull ${FRONTEND_IMAGE}
+      podman pull ${BACKEND_IMAGE}
+
+      # Start backend container
+      podman run -d --name backend-test -p 8000:8000 ${BACKEND_IMAGE}
+
+      # Wait for backend to be ready
+      sleep 10
+      curl --retry 5 --retry-delay 5 --retry-connrefused http://localhost:8000/health
+
+      # Run frontend integration tests against backend
+      podman run --network host ${FRONTEND_IMAGE} npm run test:integration
+  needs: ["build:frontend", "build:backend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+# -----------------------------------------------------------------------------
+# Security Scan Stage
+# -----------------------------------------------------------------------------
+
+scan:frontend:
+  stage: scan
+  image: node:20-alpine
+  script:
+    - cd frontend
+    - npm audit --audit-level=critical
+    - npm run lint
+  needs: ["test:frontend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+scan:backend:
+  stage: scan
+  image: python:3.11-slim
+  before_script:
+    - pip install safety poetry
+  script:
+    - cd backend
+    - source .venv/bin/activate
+    - poetry export -f requirements.txt --without-hashes | safety check --full-report
+    - poetry run pylint backend/ --disable=all --enable=E,F
+    - poetry run bandit -r backend/
+  needs: ["test:backend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "staging"
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+# -----------------------------------------------------------------------------
+# Deploy Stage - Amazon ECS Fargate
+# -----------------------------------------------------------------------------
+
+# Deploy to Dev Environment (from develop branch)
+deploy:dev:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  before_script:
+    - aws configure set region ${AWS_REGION}
+    - aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+    - aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+  script:
+    - |
+      echo "Deploying to Dev Environment on ECS Fargate"
+      
+      # Update ECS service with new task definition
+      # Frontend
+      aws ecs update-service \
+        --cluster yourproject-dev-cluster \
+        --service frontend-dev-service \
+        --task-definition frontend-dev-task \
+        --force-new-deployment
+      
+      # Backend
+      aws ecs update-service \
+        --cluster yourproject-dev-cluster \
+        --service backend-dev-service \
+        --task-definition backend-dev-task \
+        --force-new-deployment
+      
+      # Wait for deployments to complete
+      aws ecs wait services-stable \
+        --cluster yourproject-dev-cluster \
+        --services frontend-dev-service backend-dev-service
+      
+      echo "Dev deployment successful!"
+  environment:
+    name: dev
+    url: https://dev.yourproject.com
+  needs: ["build:frontend", "build:backend", "test:frontend", "test:backend"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# Deploy to Staging Environment (from staging branch)
+deploy:staging:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  before_script:
+    - aws configure set region ${AWS_REGION}
+    - aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+    - aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+  script:
+    - |
+      echo "Deploying to Staging Environment (Production Twin) on ECS Fargate"
+      
+      # Register new task definitions with staging images
+      FRONTEND_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://ecs/task-definitions/frontend-staging.json \
+        | jq -r '.taskDefinition.taskDefinitionArn')
+      
+      BACKEND_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://ecs/task-definitions/backend-staging.json \
+        | jq -r '.taskDefinition.taskDefinitionArn')
+      
+      # Update ECS services
+      aws ecs update-service \
+        --cluster yourproject-staging-cluster \
+        --service frontend-staging-service \
+        --task-definition ${FRONTEND_TASK_ARN} \
+        --force-new-deployment
+      
+      aws ecs update-service \
+        --cluster yourproject-staging-cluster \
+        --service backend-staging-service \
+        --task-definition ${BACKEND_TASK_ARN} \
+        --force-new-deployment
+      
+      # Wait for deployments to complete
+      aws ecs wait services-stable \
+        --cluster yourproject-staging-cluster \
+        --services frontend-staging-service backend-staging-service
+      
+      # Run smoke tests
+      STAGING_URL="https://staging.yourproject.com"
+      curl --retry 10 --retry-delay 5 --retry-connrefused ${STAGING_URL}/health
+      curl --retry 10 --retry-delay 5 --retry-connrefused ${STAGING_URL}/api/health
+      
+      echo "Staging deployment successful!"
+  environment:
+    name: staging
+    url: https://staging.yourproject.com
+  needs:
+    - job: build:frontend
+      artifacts: false
+    - job: build:backend
+      artifacts: false
+    - job: test:integration
+  rules:
+    - if: $CI_COMMIT_BRANCH == "staging"
+      when: manual
+
+# Deploy to Production (from tags on main)
+deploy:production:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  before_script:
+    - aws configure set region ${AWS_REGION}
+    - aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+    - aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+  script:
+    - |
+      echo "Deploying to Production from tag ${CI_COMMIT_TAG} on ECS Fargate"
+      
+      # Register new task definitions with production images
+      FRONTEND_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://ecs/task-definitions/frontend-production.json \
+        | jq -r '.taskDefinition.taskDefinitionArn')
+      
+      BACKEND_TASK_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://ecs/task-definitions/backend-production.json \
+        | jq -r '.taskDefinition.taskDefinitionArn')
+      
+      # Update ECS services
+      aws ecs update-service \
+        --cluster yourproject-production-cluster \
+        --service frontend-production-service \
+        --task-definition ${FRONTEND_TASK_ARN} \
+        --force-new-deployment
+      
+      aws ecs update-service \
+        --cluster yourproject-production-cluster \
+        --service backend-production-service \
+        --task-definition ${BACKEND_TASK_ARN} \
+        --force-new-deployment
+      
+      # Wait for deployments to complete
+      aws ecs wait services-stable \
+        --cluster yourproject-production-cluster \
+        --services frontend-production-service backend-production-service
+      
+      # Run smoke tests
+      PROD_URL="https://yourproject.com"
+      curl --retry 10 --retry-delay 5 --retry-connrefused ${PROD_URL}/health
+      curl --retry 10 --retry-delay 5 --retry-connrefused ${PROD_URL}/api/health
+      
+      echo "Production deployment successful!"
+  environment:
+    name: production
+    url: https://yourproject.com
+  needs:
+    - job: build:frontend
+      artifacts: false
+    - job: build:backend
+      artifacts: false
+    - job: scan:frontend
+      artifacts: false
+    - job: scan:backend
+      artifacts: false
+    - job: test:integration
+      artifacts: false
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: manual
